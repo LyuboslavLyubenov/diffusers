@@ -27,6 +27,8 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+import numpy
+
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
@@ -86,6 +88,11 @@ def parse_args():
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
+
+    parser.add_argument("--validation_data_dir",
+                        type=str,
+                        default=None)
+
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -454,8 +461,20 @@ def main(args):
             cache_dir=args.cache_dir,
             split="train",
         )
+        dataset_validation = load_dataset(
+            args.dataset_name_validation,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            split="validation"
+        )
     else:
         dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
+        dataset_validation = load_dataset(
+            args.validation_data_dir,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            split="validation"
+        )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
@@ -477,8 +496,14 @@ def main(args):
     logger.info(f"Dataset size: {len(dataset)}")
 
     dataset.set_transform(transform_images)
+    dataset_validation.set_transform(transform_images)
+
     train_dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+    )
+
+    validation_dataloader = torch.utils.data.DataLoader(
+        dataset_validation, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
     )
 
     # Initialize the learning rate scheduler
@@ -490,8 +515,8 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, lr_scheduler, validation_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler, validation_dataloader
     )
 
     if args.use_ema:
@@ -629,7 +654,9 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            train_loss = loss.detach().item()
+ 
+            logs = {"train_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
@@ -640,6 +667,29 @@ def main(args):
 
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
+            validation_loss_arr = []
+
+            for step, batch in enumerate(validation_dataloader):
+                clean_images = batch["input"]
+                # Sample noise that we'll add to the images
+                noise = torch.randn(
+                    clean_images.shape, dtype=(torch.float32 if args.mixed_precision == "no" else torch.float16)
+                ).to(clean_images.device)
+                bsz = clean_images.shape[0]
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                ).long()
+                # Add noise to the clean images according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+                model_output = model(noisy_images, timesteps).sample
+                validation_loss = F.mse_loss(model_output, noise)
+                validation_loss_arr.append(validation_loss.detach().item())
+
+
+            validation_loss = sum(validation_loss_arr) / len(validation_loss_arr)
+            accelerator.log({ "validation_loss": validation_loss }, step=global_step)
+
             if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
                 unet = accelerator.unwrap_model(model)
 
@@ -652,10 +702,10 @@ def main(args):
                     scheduler=noise_scheduler,
                 )
 
-                generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                # generator = torch.Generator(device=pipeline.device).manual_seed(0)
                 # run pipeline in inference (sample random noise and denoise)
                 images = pipeline(
-                    generator=generator,
+                    # generator=generator,
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="numpy",
